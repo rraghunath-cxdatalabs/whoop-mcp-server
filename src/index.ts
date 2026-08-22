@@ -303,12 +303,12 @@ function createMcpServer(): Server {
 						stats = result.stats;
 					}
 
-					return {
-						content: [{
-							type: 'text',
-							text: `Sync complete!\n- Cycles: ${stats?.cycles}\n- Recoveries: ${stats?.recoveries}\n- Sleeps: ${stats?.sleeps}\n- Workouts: ${stats?.workouts}`,
-						}],
-					};
+					let text = `Sync complete!\n- Cycles: ${stats?.cycles}\n- Recoveries: ${stats?.recoveries}\n- Sleeps: ${stats?.sleeps}\n- Workouts: ${stats?.workouts}`;
+					if (stats?.skipped) {
+						text += `\n- Skipped (unmappable, see server log): ${stats.skipped}`;
+					}
+
+					return { content: [{ type: 'text', text }] };
 				}
 
 				case 'get_auth_url': {

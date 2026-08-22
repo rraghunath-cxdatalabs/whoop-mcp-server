@@ -84,32 +84,68 @@ export class WhoopClient {
 	}
 
 	private async refreshTokens(): Promise<void> {
-		if (!this.tokens?.refresh_token) {
+		const previousRefreshToken = this.tokens?.refresh_token;
+		if (!previousRefreshToken) {
 			throw new Error('No refresh token available');
 		}
+
+		// Whoop requires scope=offline on refresh requests. Omitting it gets an
+		// invalid_request whose error_hint talks about redirect_uri whitelisting,
+		// which sends you looking in the wrong place entirely.
+		const body = new URLSearchParams({
+			grant_type: 'refresh_token',
+			refresh_token: previousRefreshToken,
+			client_id: this.clientId,
+			client_secret: this.clientSecret,
+			scope: 'offline',
+		});
 
 		const response = await fetch(`${WHOOP_AUTH_BASE}/token`, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-			body: new URLSearchParams({
-				grant_type: 'refresh_token',
-				refresh_token: this.tokens.refresh_token,
-				client_id: this.clientId,
-				client_secret: this.clientSecret,
-			}),
+			body,
 		});
 
+		const raw = await response.text();
+
 		if (!response.ok) {
-			throw new Error(`Token refresh failed: ${await response.text()}`);
+			console.error(
+				`[whoop] token refresh failed: HTTP ${response.status} ${response.statusText}\n` +
+				`[whoop] request scopes: offline; client_id ends ...${this.clientId.slice(-4)}\n` +
+				`[whoop] whoop response: ${raw || '(empty body)'}`
+			);
+			throw new Error(`Token refresh failed: HTTP ${response.status} ${raw || '(empty body)'}`);
 		}
 
-		const data = await response.json() as { access_token: string; refresh_token: string; expires_in: number };
+		let data: { access_token?: string; refresh_token?: string; expires_in?: number };
+		try {
+			data = JSON.parse(raw) as typeof data;
+		} catch {
+			console.error(`[whoop] token refresh returned a non-JSON body: ${raw || '(empty body)'}`);
+			throw new Error('Token refresh failed: response was not JSON');
+		}
+
+		if (!data.access_token) {
+			console.error(`[whoop] token refresh response carried no access_token: ${raw}`);
+			throw new Error('Token refresh failed: no access_token in response');
+		}
+
+		if (!data.refresh_token) {
+			console.error('[whoop] refresh response omitted refresh_token; retaining the previous one');
+		}
+
+		// Whoop rotates refresh tokens: replaying a spent one fails, so the new
+		// value has to replace the old. Falling back to the previous token only
+		// when the field is genuinely absent keeps us from persisting undefined
+		// over a working token.
 		this.tokens = {
 			access_token: data.access_token,
-			refresh_token: data.refresh_token,
-			expires_at: Date.now() + data.expires_in * 1000,
+			refresh_token: data.refresh_token ?? previousRefreshToken,
+			expires_at: Date.now() + (data.expires_in ?? 3600) * 1000,
 		};
 
+		// Persist before returning: the rotated token is the only one Whoop will
+		// accept from here on, and losing it means re-authorizing by hand.
 		this.onTokenRefresh?.(this.tokens);
 	}
 

@@ -1,12 +1,16 @@
 import { WhoopClient } from './whoop-client.js';
-import { WhoopDatabase } from './database.js';
+import { WhoopDatabase, type UpsertResult } from './database.js';
 
 interface SyncStats {
 	cycles: number;
 	recoveries: number;
 	sleeps: number;
 	workouts: number;
+	/** Records whose mapping threw; they were logged and skipped, not stored. */
+	skipped: number;
 }
+
+const NO_ROWS: UpsertResult = { upserted: 0, skipped: 0 };
 
 interface SmartSyncResult {
 	type: 'full' | 'quick' | 'skip';
@@ -27,6 +31,23 @@ export class WhoopSync {
 		const startDate = new Date();
 		startDate.setDate(startDate.getDate() - days);
 
+		// A record fetched while still PENDING_SCORE carries no score. Whoop fills
+		// it in hours later, so unless the window reaches back to the oldest
+		// pending record it stays permanently unscored -- the 7-day quick sync
+		// would otherwise walk straight past it.
+		const oldestPending = this.db.getOldestPendingScoreDate();
+		if (oldestPending) {
+			const pendingStart = new Date(oldestPending);
+			if (!Number.isNaN(pendingStart.getTime()) && pendingStart < startDate) {
+				// A day of slack absorbs timezone_offset skew at the boundary.
+				pendingStart.setDate(pendingStart.getDate() - 1);
+				startDate.setTime(pendingStart.getTime());
+				console.error(
+					`[whoop] widened sync window back to ${startDate.toISOString()} to re-fetch PENDING_SCORE records`
+				);
+			}
+		}
+
 		const start = startDate.toISOString();
 		const end = endDate.toISOString();
 
@@ -37,21 +58,28 @@ export class WhoopSync {
 			this.client.getAllWorkouts({ start, end }),
 		]);
 
-		if (cycles.length > 0) this.db.upsertCycles(cycles);
-		if (recoveries.length > 0) this.db.upsertRecoveries(recoveries);
-		if (sleeps.length > 0) this.db.upsertSleeps(sleeps);
-		if (workouts.length > 0) this.db.upsertWorkouts(workouts);
+		// INSERT OR REPLACE means a re-fetched record overwrites its unscored row.
+		const cycleRows = cycles.length > 0 ? this.db.upsertCycles(cycles) : NO_ROWS;
+		const recoveryRows = recoveries.length > 0 ? this.db.upsertRecoveries(recoveries) : NO_ROWS;
+		const sleepRows = sleeps.length > 0 ? this.db.upsertSleeps(sleeps) : NO_ROWS;
+		const workoutRows = workouts.length > 0 ? this.db.upsertWorkouts(workouts) : NO_ROWS;
 
 		this.db.updateSyncState(
 			startDate.toISOString().split('T')[0],
 			endDate.toISOString().split('T')[0]
 		);
 
+		const skipped = cycleRows.skipped + recoveryRows.skipped + sleepRows.skipped + workoutRows.skipped;
+		if (skipped > 0) {
+			console.error(`[whoop] sync finished with ${skipped} record(s) skipped; see the entries above`);
+		}
+
 		return {
-			cycles: cycles.length,
-			recoveries: recoveries.length,
-			sleeps: sleeps.length,
-			workouts: workouts.length,
+			cycles: cycleRows.upserted,
+			recoveries: recoveryRows.upserted,
+			sleeps: sleepRows.upserted,
+			workouts: workoutRows.upserted,
+			skipped,
 		};
 	}
 
@@ -79,7 +107,9 @@ export class WhoopSync {
 		const lastSync = new Date(state.lastSyncAt);
 		const hoursSinceSync = (Date.now() - lastSync.getTime()) / (1000 * 60 * 60);
 
-		if (hoursSinceSync < 1) {
+		// Never skip while something is still unscored: the whole point of coming
+		// back is to pick up the score Whoop has since computed.
+		if (hoursSinceSync < 1 && this.db.countPendingScoreRecords() === 0) {
 			return { type: 'skip' };
 		}
 
