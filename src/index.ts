@@ -2,10 +2,11 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { CallToolRequestSchema, ListToolsRequestSchema, ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
-import express, { type Request, type Response } from 'express';
+import express, { type Request, type Response, type NextFunction } from 'express';
 import { WhoopClient } from './whoop-client.js';
 import { WhoopDatabase } from './database.js';
 import { WhoopSync } from './sync.js';
+import { secureToken, verifyPkceS256, baseUrl, AUTH_CODE_TTL_MS, ACCESS_TOKEN_TTL_MS } from './oauth.js';
 
 interface ToolArguments {
 	days?: number;
@@ -341,7 +342,213 @@ async function main(): Promise<void> {
 		process.stderr.write('Whoop MCP server running on stdio\n');
 	} else {
 		const app = express();
+		app.set('trust proxy', true);
 		app.use(express.json());
+		app.use(express.urlencoded({ extended: true }));
+
+		app.get('/.well-known/oauth-authorization-server', (req: Request, res: Response) => {
+			const base = baseUrl(req);
+			res.json({
+				issuer: base,
+				authorization_endpoint: `${base}/oauth/authorize`,
+				token_endpoint: `${base}/oauth/token`,
+				registration_endpoint: `${base}/register`,
+				response_types_supported: ['code'],
+				grant_types_supported: ['authorization_code', 'refresh_token'],
+				code_challenge_methods_supported: ['S256'],
+				token_endpoint_auth_methods_supported: ['none', 'client_secret_post'],
+				scopes_supported: ['mcp'],
+			});
+		});
+
+		app.get('/.well-known/oauth-protected-resource', (req: Request, res: Response) => {
+			const base = baseUrl(req);
+			res.json({
+				resource: `${base}/mcp`,
+				authorization_servers: [base],
+			});
+		});
+
+		app.post('/register', (req: Request, res: Response) => {
+			const body = req.body as { redirect_uris?: unknown; client_name?: unknown; token_endpoint_auth_method?: unknown } | undefined;
+			const redirectUris = body?.redirect_uris;
+			if (!Array.isArray(redirectUris) || redirectUris.length === 0 || !redirectUris.every(u => typeof u === 'string')) {
+				res.status(400).json({ error: 'invalid_redirect_uri', error_description: 'redirect_uris must be a non-empty string array' });
+				return;
+			}
+			const authMethod = typeof body?.token_endpoint_auth_method === 'string' ? body.token_endpoint_auth_method : 'none';
+			const clientId = secureToken(16);
+			const clientSecret = authMethod === 'none' ? null : secureToken(32);
+			const clientName = typeof body?.client_name === 'string' ? body.client_name : null;
+
+			db.createOAuthClient({
+				client_id: clientId,
+				client_secret: clientSecret,
+				client_name: clientName,
+				redirect_uris: redirectUris as string[],
+			});
+
+			res.status(201).json({
+				client_id: clientId,
+				...(clientSecret ? { client_secret: clientSecret } : {}),
+				client_id_issued_at: Math.floor(Date.now() / 1000),
+				client_secret_expires_at: 0,
+				redirect_uris: redirectUris,
+				token_endpoint_auth_method: authMethod,
+				grant_types: ['authorization_code', 'refresh_token'],
+				response_types: ['code'],
+				...(clientName ? { client_name: clientName } : {}),
+			});
+		});
+
+		app.get('/oauth/authorize', (req: Request, res: Response) => {
+			const clientId = req.query.client_id as string | undefined;
+			const redirectUri = req.query.redirect_uri as string | undefined;
+			const responseType = req.query.response_type as string | undefined;
+			const codeChallenge = req.query.code_challenge as string | undefined;
+			const codeChallengeMethod = req.query.code_challenge_method as string | undefined;
+			const state = req.query.state as string | undefined;
+			const scope = req.query.scope as string | undefined;
+
+			if (!clientId) { res.status(400).send('Missing client_id'); return; }
+			const oauthClient = db.getOAuthClient(clientId);
+			if (!oauthClient) { res.status(400).send('Unknown client_id'); return; }
+			if (!redirectUri || !oauthClient.redirect_uris.includes(redirectUri)) {
+				res.status(400).send('Invalid redirect_uri');
+				return;
+			}
+
+			const redirect = new URL(redirectUri);
+			const fail = (err: string, desc?: string): void => {
+				redirect.searchParams.set('error', err);
+				if (desc) redirect.searchParams.set('error_description', desc);
+				if (state) redirect.searchParams.set('state', state);
+				res.redirect(302, redirect.toString());
+			};
+
+			if (responseType !== 'code') { fail('unsupported_response_type'); return; }
+			if (!codeChallenge || codeChallengeMethod !== 'S256') {
+				fail('invalid_request', 'PKCE S256 code_challenge is required');
+				return;
+			}
+
+			const code = secureToken(32);
+			db.createOAuthCode({
+				code,
+				client_id: clientId,
+				redirect_uri: redirectUri,
+				code_challenge: codeChallenge,
+				code_challenge_method: 'S256',
+				scope: scope ?? null,
+				expires_at: Date.now() + AUTH_CODE_TTL_MS,
+			});
+
+			redirect.searchParams.set('code', code);
+			if (state) redirect.searchParams.set('state', state);
+			res.redirect(302, redirect.toString());
+		});
+
+		app.post('/oauth/token', (req: Request, res: Response) => {
+			const body = req.body as Record<string, string | undefined> | undefined;
+			const grantType = body?.grant_type;
+
+			if (grantType === 'authorization_code') {
+				const code = body?.code;
+				const redirectUri = body?.redirect_uri;
+				const clientId = body?.client_id;
+				const codeVerifier = body?.code_verifier;
+
+				if (!code || !redirectUri || !clientId || !codeVerifier) {
+					res.status(400).json({ error: 'invalid_request' });
+					return;
+				}
+				const oauthClient = db.getOAuthClient(clientId);
+				if (!oauthClient) { res.status(401).json({ error: 'invalid_client' }); return; }
+
+				const authCode = db.consumeOAuthCode(code);
+				if (!authCode || authCode.client_id !== clientId || authCode.redirect_uri !== redirectUri) {
+					res.status(400).json({ error: 'invalid_grant' });
+					return;
+				}
+				if (!verifyPkceS256(codeVerifier, authCode.code_challenge)) {
+					res.status(400).json({ error: 'invalid_grant', error_description: 'PKCE verification failed' });
+					return;
+				}
+
+				const accessToken = secureToken(32);
+				const refreshToken = secureToken(32);
+				db.createOAuthToken({
+					access_token: accessToken,
+					refresh_token: refreshToken,
+					client_id: clientId,
+					expires_at: Date.now() + ACCESS_TOKEN_TTL_MS,
+					scope: authCode.scope,
+				});
+
+				res.json({
+					access_token: accessToken,
+					token_type: 'Bearer',
+					expires_in: Math.floor(ACCESS_TOKEN_TTL_MS / 1000),
+					refresh_token: refreshToken,
+					...(authCode.scope ? { scope: authCode.scope } : {}),
+				});
+				return;
+			}
+
+			if (grantType === 'refresh_token') {
+				const refreshToken = body?.refresh_token;
+				const clientId = body?.client_id;
+				if (!refreshToken || !clientId) { res.status(400).json({ error: 'invalid_request' }); return; }
+				const oauthClient = db.getOAuthClient(clientId);
+				if (!oauthClient) { res.status(401).json({ error: 'invalid_client' }); return; }
+
+				const existing = db.consumeRefreshToken(refreshToken);
+				if (!existing || existing.client_id !== clientId) {
+					res.status(400).json({ error: 'invalid_grant' });
+					return;
+				}
+
+				const accessToken = secureToken(32);
+				const newRefresh = secureToken(32);
+				db.createOAuthToken({
+					access_token: accessToken,
+					refresh_token: newRefresh,
+					client_id: clientId,
+					expires_at: Date.now() + ACCESS_TOKEN_TTL_MS,
+					scope: existing.scope,
+				});
+
+				res.json({
+					access_token: accessToken,
+					token_type: 'Bearer',
+					expires_in: Math.floor(ACCESS_TOKEN_TTL_MS / 1000),
+					refresh_token: newRefresh,
+					...(existing.scope ? { scope: existing.scope } : {}),
+				});
+				return;
+			}
+
+			res.status(400).json({ error: 'unsupported_grant_type' });
+		});
+
+		function requireBearer(req: Request, res: Response, next: NextFunction): void {
+			const wwwAuth = `Bearer resource_metadata="${baseUrl(req)}/.well-known/oauth-protected-resource"`;
+			const header = req.headers.authorization;
+			const match = header?.match(/^Bearer\s+(.+)$/i);
+			const token = match?.[1];
+			if (!token) {
+				res.setHeader('WWW-Authenticate', wwwAuth);
+				res.status(401).json({ error: 'invalid_token', error_description: 'Missing bearer token' });
+				return;
+			}
+			const record = db.getOAuthAccessToken(token);
+			if (!record) {
+				res.setHeader('WWW-Authenticate', `${wwwAuth}, error="invalid_token"`);
+				res.status(401).json({ error: 'invalid_token', error_description: 'Invalid or expired token' });
+				return;
+			}
+			next();
+		}
 
 		const authScopes = ['read:profile', 'read:body_measurement', 'read:cycles', 'read:recovery', 'read:sleep', 'read:workout', 'offline'];
 
@@ -370,7 +577,7 @@ async function main(): Promise<void> {
 			res.json({ status: 'ok', authenticated: Boolean(db.getTokens()) });
 		});
 
-		app.all('/mcp', async (req: Request, res: Response) => {
+		app.all('/mcp', requireBearer, async (req: Request, res: Response) => {
 			const sessionId = req.headers['mcp-session-id'] as string | undefined;
 
 			if (req.method === 'DELETE' && sessionId && transports.has(sessionId)) {
