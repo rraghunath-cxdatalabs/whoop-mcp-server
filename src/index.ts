@@ -343,6 +343,12 @@ async function main(): Promise<void> {
 		const app = express();
 		app.use(express.json());
 
+		const authScopes = ['read:profile', 'read:body_measurement', 'read:cycles', 'read:recovery', 'read:sleep', 'read:workout', 'offline'];
+
+		app.get('/auth', (_req: Request, res: Response) => {
+			res.redirect(302, client.getAuthorizationUrl(authScopes));
+		});
+
 		app.get('/callback', async (req: Request, res: Response) => {
 			const code = req.query.code as string | undefined;
 			if (!code) {
