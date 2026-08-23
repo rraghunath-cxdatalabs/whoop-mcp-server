@@ -7,6 +7,7 @@ import { WhoopClient } from './whoop-client.js';
 import { WhoopDatabase } from './database.js';
 import { WhoopSync } from './sync.js';
 import { secureToken, verifyPkceS256, baseUrl, AUTH_CODE_TTL_MS, ACCESS_TOKEN_TTL_MS } from './oauth.js';
+import type { DbWorkout } from './types.js';
 
 interface ToolArguments {
 	days?: number;
@@ -80,6 +81,85 @@ function getStrainZone(strain: number): string {
 	return 'Light (0-9)';
 }
 
+/**
+ * Whoop identifies activities by a numeric sport_id, and that number is all the
+ * workouts table stores. This map is best-effort: an unlisted id renders as
+ * `Sport <id>` rather than risk putting a wrong label on real training data.
+ * Add entries here as you confirm them.
+ */
+const SPORT_NAMES = new Map<number, string>([
+	[-1, 'Activity'],
+	[0, 'Running'],
+	[1, 'Cycling'],
+	[16, 'Baseball'],
+	[18, 'Basketball'],
+	[22, 'Golf'],
+	[24, 'Ice Hockey'],
+	[34, 'Soccer'],
+	[39, 'Swimming'],
+	[42, 'Tennis'],
+	[44, 'Volleyball'],
+	[48, 'Boxing'],
+	[52, 'Dance'],
+	[55, 'Functional Fitness'],
+	[59, 'Hiking/Rucking'],
+	[66, 'Rowing'],
+	[73, 'Spin'],
+	[74, 'Stairmaster'],
+	[83, 'Weightlifting'],
+	[84, 'Yoga'],
+	[85, 'Elliptical'],
+	[86, 'Jump Rope'],
+]);
+
+function sportName(sportId: number): string {
+	return SPORT_NAMES.get(sportId) ?? `Sport ${sportId}`;
+}
+
+/**
+ * The workouts table stores UTC instants and no timezone_offset, so there is no
+ * way to recover the athlete's local time. Both of these format in UTC rather
+ * than the host's zone, so the same row renders identically everywhere.
+ */
+function formatClockUtc(isoString: string): string {
+	const d = new Date(isoString);
+	if (Number.isNaN(d.getTime())) return '??:??';
+	return d.toLocaleTimeString('en-US', {
+		hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'UTC',
+	});
+}
+
+function formatDateUtc(isoString: string): string {
+	const d = new Date(isoString);
+	if (Number.isNaN(d.getTime())) return 'Unknown date';
+	return d.toLocaleDateString('en-US', {
+		weekday: 'short', month: 'short', day: 'numeric', timeZone: 'UTC',
+	});
+}
+
+function elapsedMillis(startTime: string, endTime: string): number {
+	const ms = new Date(endTime).getTime() - new Date(startTime).getTime();
+	return Number.isFinite(ms) && ms > 0 ? ms : 0;
+}
+
+/** Per-zone time, or a note when the workout carries no zone breakdown yet. */
+function formatZones(w: DbWorkout): string {
+	const zones: Array<[string, number | null]> = [
+		['Z0', w.zone_zero_milli],
+		['Z1', w.zone_one_milli],
+		['Z2', w.zone_two_milli],
+		['Z3', w.zone_three_milli],
+		['Z4', w.zone_four_milli],
+		['Z5', w.zone_five_milli],
+	];
+
+	if (zones.every(([, value]) => value === null)) return 'no zone data yet';
+
+	return zones
+		.map(([label, value]) => `${label} ${value === null ? '--' : Math.round(value / 60_000) + 'm'}`)
+		.join(' | ');
+}
+
 function validateDays(value: unknown): number {
 	if (value === undefined || value === null) return 14;
 	const num = typeof value === 'number' ? value : Number.parseInt(String(value), 10);
@@ -134,6 +214,16 @@ function createMcpServer(): Server {
 				},
 			},
 			{
+				name: 'get_workouts',
+				description:
+					'List individual workouts from the last N days with sport, strain, average and max heart rate, and time spent in each heart-rate zone.',
+				inputSchema: {
+					type: 'object',
+					properties: { days: { type: 'number', description: 'Number of days to list (default: 14, max: 90)' } },
+					required: [],
+				},
+			},
+			{
 				name: 'sync_data',
 				description: 'Manually trigger a data sync from Whoop.',
 				inputSchema: {
@@ -155,7 +245,7 @@ function createMcpServer(): Server {
 		const typedArgs = (args ?? {}) as ToolArguments;
 
 		try {
-			const dataTools = ['get_today', 'get_recovery_trends', 'get_sleep_analysis', 'get_strain_history'];
+			const dataTools = ['get_today', 'get_recovery_trends', 'get_sleep_analysis', 'get_strain_history', 'get_workouts'];
 			if (dataTools.includes(name)) {
 				const tokens = db.getTokens();
 				if (!tokens) {
@@ -279,6 +369,50 @@ function createMcpServer(): Server {
 					const avgCalories = trends.reduce((sum, d) => sum + (d.calories || 0), 0) / trends.length;
 
 					response += `\n## Averages\n- **Daily Strain**: ${avgStrain.toFixed(1)}\n- **Daily Calories**: ${Math.round(avgCalories)} kcal\n`;
+
+					return { content: [{ type: 'text', text: response }] };
+				}
+
+				case 'get_workouts': {
+					const days = validateDays(typedArgs.days);
+					const workouts = db.getRecentWorkouts(days);
+
+					if (workouts.length === 0) {
+						return { content: [{ type: 'text', text: `No workouts recorded in the last ${days} days.` }] };
+					}
+
+					let response = `# Workouts (Last ${days} Days)\n\n`;
+
+					for (const w of workouts) {
+						const duration = elapsedMillis(w.start_time, w.end_time);
+
+						response += `## ${formatDateUtc(w.start_time)} -- ${sportName(w.sport_id)}\n`;
+						response += `- **Time**: ${formatClockUtc(w.start_time)}-${formatClockUtc(w.end_time)} UTC (${formatDuration(duration)})\n`;
+						response += `- **Strain**: ${w.strain === null ? 'N/A' : `${w.strain.toFixed(1)} ${getStrainZone(w.strain)}`}\n`;
+						response += `- **Heart Rate**: avg ${w.avg_hr ?? 'N/A'} bpm, max ${w.max_hr ?? 'N/A'} bpm\n`;
+						response += `- **Zones**: ${formatZones(w)}\n`;
+						if (w.kilojoule !== null) {
+							response += `- **Energy**: ${Math.round(w.kilojoule / 4.184)} kcal\n`;
+						}
+						if (w.score_state !== 'SCORED') {
+							response += `- **Note**: score_state is ${w.score_state}; metrics may fill in on a later sync\n`;
+						}
+						response += '\n';
+					}
+
+					const scored = workouts.filter(w => w.strain !== null);
+					const totalMillis = workouts.reduce((sum, w) => sum + elapsedMillis(w.start_time, w.end_time), 0);
+
+					response += `## Summary\n`;
+					response += `- **Workouts**: ${workouts.length}\n`;
+					response += `- **Total Time**: ${formatDuration(totalMillis)}\n`;
+					if (scored.length > 0) {
+						const avgStrain = scored.reduce((sum, w) => sum + (w.strain ?? 0), 0) / scored.length;
+						response += `- **Average Strain**: ${avgStrain.toFixed(1)}\n`;
+					}
+					if (scored.length < workouts.length) {
+						response += `- **Unscored**: ${workouts.length - scored.length} of ${workouts.length}\n`;
+					}
 
 					return { content: [{ type: 'text', text: response }] };
 				}

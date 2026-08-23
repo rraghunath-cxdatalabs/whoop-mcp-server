@@ -520,6 +520,19 @@ export class WhoopDatabase {
 		`).all(startDate, endDate) as DbWorkout[];
 	}
 
+	/**
+	 * Workouts started within the last `days` days, newest first. Rows come back
+	 * whatever their score_state, so an unscored workout still appears with null
+	 * metrics instead of vanishing from the report.
+	 */
+	getRecentWorkouts(days: number): DbWorkout[] {
+		return this.db.prepare(`
+			SELECT * FROM workouts
+			WHERE start_time >= DATE('now', '-' || ? || ' days')
+			ORDER BY start_time DESC
+		`).all(days) as DbWorkout[];
+	}
+
 	getRecoveryTrends(days: number): RecoveryTrendRow[] {
 		return this.db.prepare(`
 			SELECT DATE(created_at) as date, recovery_score, hrv_rmssd as hrv, resting_hr as rhr
