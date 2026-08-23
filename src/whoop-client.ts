@@ -12,6 +12,21 @@ import type {
 const WHOOP_API_BASE = 'https://api.prod.whoop.com/developer';
 const WHOOP_AUTH_BASE = 'https://api.prod.whoop.com/oauth/oauth2';
 
+let rawWorkoutLogged = false;
+
+/**
+ * With WHOOP_DEBUG_RAW=1, dump the first workout record this process sees,
+ * verbatim, so the API's real field names can be read off the log. Off by
+ * default: the payload is personal health data and belongs in a log only when
+ * you are deliberately inspecting the response shape.
+ */
+function maybeLogRawWorkout(record: unknown): void {
+	if (rawWorkoutLogged || process.env.WHOOP_DEBUG_RAW !== '1' || !record) return;
+	rawWorkoutLogged = true;
+	console.error('[whoop] raw workout record from /v2/activity/workout:');
+	console.error(JSON.stringify(record, null, 2));
+}
+
 interface WhoopClientConfig {
 	clientId: string;
 	clientSecret: string;
@@ -217,7 +232,9 @@ export class WhoopClient {
 		if (params?.end) queryParams.end = params.end;
 		if (params?.limit) queryParams.limit = params.limit.toString();
 		if (params?.nextToken) queryParams.nextToken = params.nextToken;
-		return this.request<WhoopPaginatedResponse<WhoopWorkout>>('/v2/activity/workout', queryParams);
+		const response = await this.request<WhoopPaginatedResponse<WhoopWorkout>>('/v2/activity/workout', queryParams);
+		maybeLogRawWorkout(response.records?.[0]);
+		return response;
 	}
 
 	async getAllCycles(params?: { start?: string; end?: string }): Promise<WhoopCycle[]> {

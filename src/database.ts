@@ -6,6 +6,7 @@ import type {
 	WhoopRecovery,
 	WhoopSleep,
 	WhoopWorkout,
+	WhoopZoneDurations,
 	DbCycle,
 	DbRecovery,
 	DbSleep,
@@ -108,6 +109,16 @@ export interface UpsertResult {
  * A single malformed record must not take the whole sync down with it, so every
  * row is mapped inside its own try/catch and failures are reported here.
  */
+/**
+ * Whoop v2 returns the heart-rate zone breakdown as score.zone_durations.
+ * The v1 singular spelling is accepted as a fallback; reading a path that does
+ * not exist yields undefined, which is how every zone column silently became
+ * null before this was corrected.
+ */
+function workoutZones(score: WhoopWorkout['score']): WhoopZoneDurations | undefined {
+	return score?.zone_durations ?? score?.zone_duration;
+}
+
 function logSkippedRecord(kind: string, id: string | number | undefined, error: unknown): void {
 	const reason = error instanceof Error ? error.message : String(error);
 	console.error(`[whoop] skipped ${kind} record ${id ?? '(no id)'} during sync: ${reason}`);
@@ -425,6 +436,14 @@ export class WhoopDatabase {
 			const result: UpsertResult = { upserted: 0, skipped: 0 };
 			for (const w of items) {
 				try {
+					const zones = workoutZones(w.score);
+					if (!zones && w.score && w.score_state === 'SCORED') {
+						// Tripwire: a scored workout with no zone object means the API shape
+						// moved again. Better a loud log than six more columns of null.
+						console.error(
+							`[whoop] workout ${w.id} is SCORED but has no zone durations; score keys: ${Object.keys(w.score).join(', ')}`
+						);
+					}
 					stmt.run(
 						w.id,
 						w.user_id,
@@ -436,12 +455,12 @@ export class WhoopDatabase {
 						w.score?.average_heart_rate ?? null,
 						w.score?.max_heart_rate ?? null,
 						w.score?.kilojoule ?? null,
-						w.score?.zone_duration?.zone_zero_milli ?? null,
-						w.score?.zone_duration?.zone_one_milli ?? null,
-						w.score?.zone_duration?.zone_two_milli ?? null,
-						w.score?.zone_duration?.zone_three_milli ?? null,
-						w.score?.zone_duration?.zone_four_milli ?? null,
-						w.score?.zone_duration?.zone_five_milli ?? null
+						zones?.zone_zero_milli ?? null,
+						zones?.zone_one_milli ?? null,
+						zones?.zone_two_milli ?? null,
+						zones?.zone_three_milli ?? null,
+						zones?.zone_four_milli ?? null,
+						zones?.zone_five_milli ?? null
 					);
 					result.upserted++;
 				} catch (error) {
