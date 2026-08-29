@@ -51,6 +51,12 @@ export class WhoopSync {
 		const start = startDate.toISOString();
 		const end = endDate.toISOString();
 
+		// Rotate once, up front. The four fetches below run concurrently and would
+		// otherwise each discover the same expiring token and race to refresh it.
+		// The client single-flights that race safely, but doing it here keeps the
+		// contention out of the fan-out entirely.
+		await this.client.ensureAuthenticated();
+
 		const [cycles, recoveries, sleeps, workouts] = await Promise.all([
 			this.client.getAllCycles({ start, end }),
 			this.client.getAllRecoveries({ start, end }),

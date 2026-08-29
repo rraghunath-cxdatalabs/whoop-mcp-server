@@ -29,6 +29,7 @@ const client = new WhoopClient({
 	clientSecret: config.clientSecret,
 	redirectUri: config.redirectUri,
 	onTokenRefresh: tokens => db.saveTokens(tokens),
+	loadPersistedTokens: () => db.getTokens(),
 });
 
 const existingTokens = db.getTokens();
@@ -37,6 +38,20 @@ if (existingTokens) {
 }
 
 const sync = new WhoopSync(client, db);
+
+// Reported by /health so what the running image actually does can be read off a
+// curl rather than inferred from the repository. The refresh fields describe the
+// request this build sends, which is the thing that was in question and could
+// not previously be checked without waiting for a failure in the logs.
+const BUILD_INFO = {
+	commit: process.env.RAILWAY_GIT_COMMIT_SHA ?? process.env.GIT_COMMIT_SHA ?? 'unknown',
+	deploymentId: process.env.RAILWAY_DEPLOYMENT_ID ?? null,
+	// Process start, not deploy time -- a change here means the container restarted.
+	startedAt: new Date().toISOString(),
+	refreshGrantParams: ['grant_type', 'refresh_token', 'client_id', 'client_secret', 'scope'],
+	refreshScope: 'offline',
+	refreshSingleFlight: true,
+};
 
 const SESSION_TTL_MS = 30 * 60 * 1000;
 const transports = new Map<string, { transport: StreamableHTTPServerTransport; lastAccess: number }>();
@@ -708,7 +723,7 @@ async function main(): Promise<void> {
 		});
 
 		app.get('/health', (_req: Request, res: Response) => {
-			res.json({ status: 'ok', authenticated: Boolean(db.getTokens()) });
+			res.json({ status: 'ok', authenticated: Boolean(db.getTokens()), build: BUILD_INFO });
 		});
 
 		app.all('/mcp', requireBearer, async (req: Request, res: Response) => {

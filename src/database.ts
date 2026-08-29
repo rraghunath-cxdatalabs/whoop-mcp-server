@@ -143,6 +143,14 @@ export class WhoopDatabase {
 				updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 			);
 
+			CREATE TABLE IF NOT EXISTS tokens_previous (
+				id INTEGER PRIMARY KEY CHECK (id = 1),
+				access_token TEXT NOT NULL,
+				refresh_token TEXT NOT NULL,
+				expires_at INTEGER NOT NULL,
+				superseded_at TEXT DEFAULT CURRENT_TIMESTAMP
+			);
+
 			CREATE TABLE IF NOT EXISTS sync_state (
 				id INTEGER PRIMARY KEY CHECK (id = 1),
 				last_sync_at TEXT,
@@ -256,14 +264,32 @@ export class WhoopDatabase {
 		`);
 	}
 
+	/**
+	 * Store a token pair, archiving the one it supersedes in the same transaction.
+	 *
+	 * Whoop rotates refresh tokens, so the pair held here is the only thing
+	 * standing between the server and a manual re-authorization. Copying the old
+	 * row aside and writing the new one commit together: a crash between the two
+	 * rolls back to the previous pair intact rather than leaving the row empty or
+	 * half-written, and the archived pair makes it possible to tell after the
+	 * fact whether a rotation actually landed.
+	 */
 	saveTokens(tokens: WhoopTokens): void {
 		const encryptedAccess = encrypt(tokens.access_token);
 		const encryptedRefresh = encrypt(tokens.refresh_token);
 
-		this.db.prepare(`
-			INSERT OR REPLACE INTO tokens (id, access_token, refresh_token, expires_at, updated_at)
-			VALUES (1, ?, ?, ?, CURRENT_TIMESTAMP)
-		`).run(encryptedAccess, encryptedRefresh, tokens.expires_at);
+		this.db.transaction(() => {
+			// Archive whatever is being replaced before it is overwritten.
+			this.db.prepare(`
+				INSERT OR REPLACE INTO tokens_previous (id, access_token, refresh_token, expires_at, superseded_at)
+				SELECT 1, access_token, refresh_token, expires_at, CURRENT_TIMESTAMP FROM tokens WHERE id = 1
+			`).run();
+
+			this.db.prepare(`
+				INSERT OR REPLACE INTO tokens (id, access_token, refresh_token, expires_at, updated_at)
+				VALUES (1, ?, ?, ?, CURRENT_TIMESTAMP)
+			`).run(encryptedAccess, encryptedRefresh, tokens.expires_at);
+		})();
 	}
 
 	getTokens(): WhoopTokens | null {
